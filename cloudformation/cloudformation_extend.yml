@@ -1,0 +1,209 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: This CFN template is extend from laravel-sail-ecs, when you has deployed the laravel-sail-ecs, you could use this template to attach the application to the same cluster.
+
+Parameters:
+  EnvS3Bucket:
+    Type: String
+    Description: Your S3 bucket name contains env file.
+    Default: ""
+  CertificateArn:
+    Type: String
+    Description: Certificate ARN.
+    Default: ""
+  ServiceTaskDesiredCount:
+    Type: Number
+    Description: Specifies the number of task to launch. 0 is for initial phrase.
+    Default: "0"
+  NetworkStackNameParameter:
+    Type: String
+    Default: "laravel-sail-ecs"
+
+Conditions:
+  CreateHttpsListener: !Not [!Equals [!Ref CertificateArn, ""]]
+
+Resources:
+  # ECR Private Repository
+  EcrPrivateRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${AWS::StackName}"
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules":[{"rulePriority":1,"description":"Remove untagged images","selection":{"tagStatus":"untagged","countType":"imageCountMoreThan","countNumber":1},"action":{"type":"expire"}}]}
+
+  # ECS
+
+  ## Task Definition
+  EcsTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}-task-definition"
+      ContainerDefinitions:
+        - Name: !Sub "${AWS::StackName}-container"
+          Image:
+            !Join [":", [!GetAtt EcrPrivateRepository.RepositoryUri, "main"]]
+          PortMappings:
+            - ContainerPort: 80
+              HostPort: 0
+              Protocol: tcp
+          EnvironmentFiles:
+            - Type: s3
+              Value: !Sub "arn:aws:s3:::${EnvS3Bucket}/${AWS::StackName}.env"
+      ExecutionRoleArn: !GetAtt EcsTaskDefinitionExecutionRole.Arn
+      Memory: "256"
+      RequiresCompatibilities:
+        - EC2
+
+  EcsTaskDefinitionExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Description: "Allows ECS tasks to call AWS services on your behalf."
+      Policies:
+        - PolicyName: policy-ecs-task-execution
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "ecr:GetAuthorizationToken"
+                  - "ecr:BatchCheckLayerAvailability"
+                  - "ecr:GetDownloadUrlForLayer"
+                  - "ecr:BatchGetImage"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "*"
+        - PolicyName: policy-s3-read-env
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                Resource: !Sub "arn:aws:s3:::${EnvS3Bucket}/${AWS::StackName}.env"
+        - PolicyName: policy-s3-read-env-bucket
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:GetBucketLocation"
+                Resource: !Sub "arn:aws:s3:::${EnvS3Bucket}"
+
+  ## Service
+  EcsService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub "${AWS::StackName}-service"
+      Cluster:
+        Fn::ImportValue: !Sub "${NetworkStackNameParameter}-EcsCluster"
+      LaunchType: EC2
+      TaskDefinition: !Ref EcsTaskDefinition
+      DesiredCount: !Ref ServiceTaskDesiredCount
+      LoadBalancers:
+        - ContainerName: !Sub "${AWS::StackName}-container"
+          ContainerPort: 80
+          TargetGroupArn: !Ref TargetGroup
+      Role:
+        Fn::ImportValue: !Sub "${NetworkStackNameParameter}-EcsRole"
+
+  # Application Load Balancer
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${AWS::StackName}-target-group"
+      VpcId:
+        Fn::ImportValue: !Sub "${NetworkStackNameParameter}-TheVpc"
+      Protocol: HTTP
+      Port: 80
+      TargetType: instance
+    DependsOn:
+      - ApplicationLoadBalancer
+
+  ApplicationLoadBalancerHttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  ApplicationLoadBalancerHttpsListener:
+    Condition: CreateHttpsListener
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${AWS::StackName}-alb"
+      SecurityGroups:
+        - Fn::ImportValue: !Sub "${NetworkStackNameParameter}-AlbSecurityGroup"
+      Subnets:
+        - Fn::ImportValue: !Sub "${NetworkStackNameParameter}-Subnet1"
+        - Fn::ImportValue: !Sub "${NetworkStackNameParameter}-Subnet2"
+
+  # S3
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "bucket-${AWS::StackName}"
+      AccessControl: PublicRead
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - '*'
+            AllowedMethods:
+              - GET
+            AllowedOrigins:
+              - '*'
+            ExposedHeaders:
+              - Date
+            Id: myCORSRuleId1
+            MaxAge: 3600
+
+  S3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3Bucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - s3:GetObject
+            Effect: Allow
+            Resource: !Sub "arn:aws:s3:::${S3Bucket}/*"
+            Principal: '*'
+            # Condition:
+            #   StringLike:
+            #     'aws:Referer':
+            #       - 'http://www.example.com/*'
+            #       - 'http://example.net/*'
+            # TODO: only get from specific domain
+
+Outputs:
+  AppUrl:
+    Description: The main url for your app behind load balancer.
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+
+  S3BucketName:
+    Description: The S3 bucket name.
+    Value: !Ref S3Bucket
