@@ -10,7 +10,7 @@ jobs:
     name: ECS Deploy
     runs-on: ubuntu-latest
     env:
-      APP_NAME: lse-admin-metronic
+      APP_NAME: qeoqeo-be-lar
       CLUSTER_NAME: qeoqeo-be-lar-cluster
       AWS_REGION: ap-southeast-1
       IMAGE_TAG: main
